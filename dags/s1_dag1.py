@@ -1,8 +1,43 @@
-import json
-
 import pendulum
+import os
+import zipfile
+import re
 
 from airflow.decorators import dag, task
+from airflow.operators.python import get_current_context
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowSkipException
+
+SHARED_BASE_DIR = "/opt/airflow/shared_workers_data"
+BUCKET_NAME_SOURCE = "citibike-data"
+BUCKET_NAME_TARGET = "123321test"
+CSV_RE = re.compile(r"\d{6}-citibike-tripdata(_\d+)?\.csv$")
+
+
+def check_if_month_already_loaded(file_name, hook) -> bool:
+    """Check if target month data already loaded"""
+    s3_hook = hook
+    response = s3_hook.list_keys(bucket_name=BUCKET_NAME_TARGET)
+
+    print(response)
+    if file_name in response:
+        return True
+    else:
+        return False
+
+def check_if_month_exists(file_name, hook) -> bool:
+    """Check if target month data exists"""
+    s3_hook = hook
+    response = s3_hook.list_keys(bucket_name=BUCKET_NAME_SOURCE)
+
+    print(response)
+    if file_name in response:
+        return True
+    else:
+        raise AirflowSkipException(f"Файл {file_name} не найден в бакете!")
+
+
 
 default_args = {
     'group': 'g4',
@@ -21,72 +56,84 @@ default_args = {
     max_active_runs=1,
     default_args=default_args,
 )
-def tutorial_taskflow_api():
-    """
-    ### TaskFlow API Tutorial Documentation
-    This is a simple data pipeline example which demonstrates the use of
-    the TaskFlow API using three simple tasks for Extract, Transform, and Load.
-    Documentation that goes along with the Airflow TaskFlow API tutorial is
-    located
-    [here](https://airflow.apache.org/docs/apache-airflow/stable/tutorial_taskflow_api.html)
-    """
-    # [END instantiate_dag]
-
-    # [START extract]
-    @task()
+def xz():
+    @task
     def extract():
-        """
-        #### Extract task
-        A simple Extract task to get data ready for the rest of the data
-        pipeline. In this case, getting data is simulated by reading from a
-        hardcoded JSON string.
-        """
-        data_string = '{"1001": 301.27, "1002": 433.21, "1003": 502.22}'
+        context = get_current_context()
+        execution_date = context["ds_nodash"][:6]
+        file_name = f"{execution_date}-citibike-tripdata.zip"
 
-        order_data_dict = json.loads(data_string)
-        return order_data_dict
+        s3_hook_yandex = S3Hook(aws_conn_id="yandex_s3")
 
-    # [END extract]
+        check_if_month_exists(file_name, s3_hook_yandex)
 
-    # [START transform]
-    @task(multiple_outputs=True)
-    def transform(order_data_dict: dict):
-        """
-        #### Transform task
-        A simple Transform task which takes in the collection of order data and
-        computes the total order value.
-        """
-        total_order_value = 0
+        downloaded_path = s3_hook_yandex.download_file(
+            key=file_name,
+            bucket_name="citibike-data",
+        )
+        print(execution_date[:6])
+        return {
+            "downloaded_path": downloaded_path,
+            "file_name": file_name,
+        }
 
-        for value in order_data_dict.values():
-            total_order_value += value
-
-        return {"total_order_value": total_order_value}
-
-    # [END transform]
-
-    # [START load]
     @task()
-    def load(total_order_value: float):
-        """
-        #### Load task
-        A simple Load task which takes in the result of the Transform task and
-        instead of saving it to end user review, just prints it out.
-        """
+    def unzip(data):
+        zip_path = data["downloaded_path"]
+        file_name = data["file_name"]
 
-        print(f"Total order value is: {total_order_value:.2f}")
+        base_dir = os.path.dirname(zip_path)
+        extract_dir = os.path.join(
+            base_dir,
+            file_name.replace(".zip", "")
+        )
 
-    # [END load]
+        os.makedirs(extract_dir, exist_ok=True)
 
-    # [START main_flow]
-    order_data = extract()
-    order_summary = transform(order_data)
-    load(order_summary["total_order_value"])
-    # [END main_flow]
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(extract_dir)
+
+        csv_files = []
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if CSV_RE.match(f):
+                    csv_files.append(os.path.join(root, f))
+
+        return csv_files
+
+    @task()
+    def load(csv_files):
+        s3_hook = S3Hook(aws_conn_id='minio')
+        context = get_current_context()
+        execution_date = context["ds_nodash"][:6]
+        keys = []
+        wrong_keys = []
+
+        for idx, file in enumerate(sorted(csv_files)):
+            part = f"{idx:02d}"
+            key = f"raw/citibike_data/{execution_date}/{execution_date}-citibike-tripdata-part{part}.csv"
+            if check_if_month_already_loaded(key, s3_hook):
+                wrong_keys.append(key)
+                print(f"Файл {file} уже загружен")
+            else:
+                s3_hook.load_file(
+                    filename=file,
+                    key=key,
+                    bucket_name=BUCKET_NAME_TARGET
+                )
+                keys.append(key)
 
 
-# [START dag_invocation]
-tutorial_taskflow_api()
-# [END dag_invocation]
+                print(f"Файл успешно загружен: {file} -> {key}")
+        return
 
-# [END tutorial]
+    @task()
+    def cleanup(total_order_value: float):
+        return
+
+    data = extract()
+    file_list = unzip(data)
+    load(file_list)
+
+
+xz()
