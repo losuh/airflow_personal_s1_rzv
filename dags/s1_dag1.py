@@ -36,24 +36,16 @@ def check_if_month_exists(file_name, list_keys) -> bool:
 
     return response
 
-
-default_args = {
-    'group': 'g4',
-	'owner': 'Daniil Konovalov',
-    'retries': 3,
-    'catchup' : True,
-}
-
 @task
 def get_date():
     context = get_current_context()
-    execution_date = context["ds_nodash"][:6]
-    return execution_date
+    exec_date = context["ds_nodash"][:6]
+    return exec_date
 
 @task
-def extract(list_keys, execution_date):
+def extract(list_keys, exec_date):
 
-    file_name = f"{execution_date}-citibike-tripdata.zip"
+    file_name = f"{exec_date}-citibike-tripdata.zip"
 
     s3_hook_yandex = S3Hook(aws_conn_id=AWS_CONN_ID_SOURCE)
 
@@ -65,7 +57,7 @@ def extract(list_keys, execution_date):
             local_path=SHARED_BASE_DIR,
         )
 
-        print(f"Скачан файл за {execution_date}")
+        print(f"Скачан файл за {exec_date}")
 
         return {
             "downloaded_path": downloaded_path,
@@ -73,7 +65,7 @@ def extract(list_keys, execution_date):
         }
 
     else:
-        raise AirflowSkipException(f"Нет данных в источнике за дату {execution_date}")
+        raise AirflowSkipException(f"Нет данных в источнике за дату {exec_date}")
 
 @task()
 def unzip(data):
@@ -96,7 +88,7 @@ def unzip(data):
     return extract_dir
 
 @task()
-def load(extract_dir, list_keys, execution_date):
+def load(extract_dir, list_keys, exec_date):
 
     csv_files = []
 
@@ -110,7 +102,7 @@ def load(extract_dir, list_keys, execution_date):
     for idx, file in enumerate(sorted(csv_files)):
 
         part = f"{idx:02d}"
-        key = f"raw/citibike_data/{execution_date}/{execution_date}-citibike-tripdata-part{part}.csv"
+        key = f"raw/citibike_data/{exec_date}/{exec_date}-citibike-tripdata-part{part}.csv"
 
         if check_if_month_exists(key, list_keys):
             print(f"Файл {file} уже загружен")
@@ -139,6 +131,12 @@ def cleanup(data, dir_path):
 
             print(f"Удалён {path}")
 
+default_args = {
+    'group': 'g4',
+	'owner': 'Daniil Konovalov',
+    'retries': 3,
+    'catchup' : True,
+}
 
 @dag(
     dag_id='g4_konovalov_daniil_s1_dag',
@@ -163,10 +161,10 @@ def s3_dag():
         bucket=BUCKET_NAME_TARGET,
         aws_conn_id=AWS_CONN_ID_TARGET,
     )
-    execution_date = get_date()
-    data = extract(list_keys_source.output, execution_date)
+    exec_date = get_date()
+    data = extract(list_keys_source.output, exec_date)
     extract_root = unzip(data)
-    load_task = load(extract_root, list_keys_target.output, execution_date)
+    load_task = load(extract_root, list_keys_target.output, exec_date)
     load_task >> cleanup(data, extract_root)
 
 s3_dag()
